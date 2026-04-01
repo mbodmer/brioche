@@ -105,10 +105,108 @@ impl StaticQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct GitRefOptions {
+    #[serde(deserialize_with = "deserialize_git_repository_url")]
     pub repository: url::Url,
 
     #[serde(rename = "ref")]
     pub ref_: String,
+}
+
+fn deserialize_git_repository_url<'de, D>(deserializer: D) -> Result<url::Url, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    use serde::de::Error as _;
+
+    let raw = String::deserialize(deserializer)?;
+
+    if let Ok(url) = url::Url::parse(&raw) {
+        return Ok(url);
+    }
+
+    let normalized = normalize_git_repository_url(&raw)
+        .ok_or_else(|| D::Error::custom(format!("invalid git repository URL: {raw}")))?;
+
+    url::Url::parse(&normalized).map_err(|error| {
+        D::Error::custom(format!(
+            "invalid git repository URL: {raw} ({error}); normalized candidate: {normalized}"
+        ))
+    })
+}
+
+fn normalize_git_repository_url(raw: &str) -> Option<String> {
+    // Accept common git SSH forms that aren't valid `url::Url` inputs.
+    //
+    // - scp-like:         user@host:path/to/repo.git
+    // - scp-like (no user): host:path/to/repo.git
+    // - malformed ssh URL: ssh://user@host:path/to/repo.git
+    //
+    // Normalize these to: ssh://user@host/path/to/repo.git
+
+    if raw.starts_with("ssh://") {
+        return normalize_ssh_url_with_colon_path(raw);
+    }
+
+    // If it already has a scheme, we don't try to guess.
+    if raw.contains("://") {
+        return None;
+    }
+
+    // scp-like form: [user@]host:path
+    let (host_part, path_part) = raw.split_once(':')?;
+    if host_part.is_empty() || path_part.is_empty() {
+        return None;
+    }
+    // Avoid treating Windows drive-letter paths as scp-like.
+    if host_part.len() == 1 && host_part.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    // If the "host" contains a slash, it's not scp-like.
+    if host_part.contains('/') {
+        return None;
+    }
+
+    Some(format!("ssh://{host_part}/{path_part}"))
+}
+
+fn normalize_ssh_url_with_colon_path(raw: &str) -> Option<String> {
+    // Convert `ssh://user@host:path` (where `path` is not a numeric port)
+    // into `ssh://user@host/path`.
+    let after_scheme = raw.strip_prefix("ssh://")?;
+
+    // Split into authority and optional path.
+    let (authority, existing_path) = match after_scheme.split_once('/') {
+        Some((authority, rest)) => (authority, Some(rest)),
+        None => (after_scheme, None),
+    };
+
+    // Skip IPv6 authorities for now (they contain ':')
+    if authority.contains('[') || authority.contains(']') {
+        return None;
+    }
+
+    let (base, colon_suffix) = authority.rsplit_once(':')?;
+
+    // If it looks like a numeric port, don't rewrite.
+    if !colon_suffix.is_empty() && colon_suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // `ssh://host:/path` has an empty suffix before the slash; treat the existing
+    // path as the real path.
+    if colon_suffix.is_empty() {
+        let existing_path = existing_path?;
+        return Some(format!("ssh://{base}/{existing_path}"));
+    }
+
+    let mut new_path = colon_suffix.to_string();
+    if let Some(existing_path) = existing_path {
+        new_path.push('/');
+        new_path.push_str(existing_path);
+    }
+
+    Some(format!("ssh://{base}/{new_path}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
